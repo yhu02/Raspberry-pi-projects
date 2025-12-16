@@ -1,0 +1,14 @@
+[project]
+name = "mushroom"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "adafruit-blinka",
+    "adafruit-circuitpython-scd4x",
+    "fastapi>=0.124.4",
+    "lgpio>=0.2.2.0",
+    "tapo>=0.8.8",
+    "uvicorn>=0.38.0",
+]
