@@ -13,13 +13,12 @@ import adafruit_scd4x
 from tapo import ApiClient  # pip/uv install tapo
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response, StreamingResponse
 import uvicorn
 
 import threading
 import time
 
-from fastapi.responses import StreamingResponse
 import cv2
 
 
@@ -89,6 +88,13 @@ class RuntimeState:
 
     # last error (shown in UI)
     last_error: Optional[str] = None
+
+    # ---- tapo retry/backoff ----
+    tapo_next_attempt_at: float = 0.0  # time.monotonic() seconds
+    tapo_backoff_s: float = 0.0
+    tapo_min_interval_s: float = 10.0
+    tapo_backoff_base_s: float = 10.0
+    tapo_backoff_max_s: float = 300.0
 
     # ---- camera (RTSP -> MJPEG) ----
     cam_rtsp_url: str = ""
@@ -195,7 +201,7 @@ def build_app(state: RuntimeState, logbuf: Deque[str]) -> FastAPI:
     async def cam_jpg():
         if not state.cam_latest_jpeg:
             return PlainTextResponse("No frame yet", status_code=503)
-        return fastapi.responses.Response(content=state.cam_latest_jpeg, media_type="image/jpeg")
+        return Response(content=state.cam_latest_jpeg, media_type="image/jpeg")
 
 
     @app.get("/api/cam.mjpg")
@@ -377,21 +383,8 @@ async def run_sensor_loop(state: RuntimeState, log: logging.Logger):
     state.co2_off = _env_int("CO2_OFF_PPM", state.co2_on - 200)
 
     # Humidifier hysteresis:
-    # - ON when RH < 85%
-    # - OFF when RH > 95%
-    state.rh_on = _env_float("RH_ON", 85.0)
-    state.rh_off = _env_float("RH_OFF", state.rh_on + 10.0)
-
-    # Safety: if env vars are wrong, force correct behavior
-    if state.rh_on >= state.rh_off:
-        log.warning("RH_ON must be < RH_OFF for humidifier mode. Forcing RH_ON=85, RH_OFF=95.")
-        state.rh_on = 85.0
-        state.rh_off = 95.0
-
-
-    # Humidifier hysteresis:
-    # - ON when RH < 85%
-    # - OFF when RH > 95%
+    # - ON when RH < RH_ON
+    # - OFF when RH > RH_OFF
     state.rh_on = _env_float("RH_ON", 85.0)
     state.rh_off = _env_float("RH_OFF", 95.0)
 
@@ -404,6 +397,11 @@ async def run_sensor_loop(state: RuntimeState, log: logging.Logger):
     # Basic validation
     if state.co2_off >= state.co2_on:
         log.warning("CO2_OFF_PPM should be < CO2_ON_PPM (got off=%s on=%s).", state.co2_off, state.co2_on)
+
+    # -------- tapo retry/backoff config --------
+    state.tapo_min_interval_s = _env_float("TAPO_MIN_COMMAND_INTERVAL_S", 10.0)
+    state.tapo_backoff_base_s = _env_float("TAPO_BACKOFF_BASE_S", 10.0)
+    state.tapo_backoff_max_s = _env_float("TAPO_BACKOFF_MAX_S", 300.0)
 
     # -------- tapo config --------
     username = _env_str("TAPO_USERNAME")
@@ -488,13 +486,33 @@ async def run_sensor_loop(state: RuntimeState, log: logging.Logger):
     # initial connect attempt
     await ensure_tapo_connected()
 
+    def _is_session_timeout(err: Exception) -> bool:
+        name = err.__class__.__name__
+        msg = str(err)
+        return ("SessionTimeout" in name) or ("SessionTimeout" in msg)
+
+    def _note_tapo_failure_backoff(now_mono: float) -> None:
+        # Exponential backoff, capped.
+        if state.tapo_backoff_s <= 0:
+            state.tapo_backoff_s = max(1.0, state.tapo_backoff_base_s)
+        else:
+            state.tapo_backoff_s = min(state.tapo_backoff_max_s, state.tapo_backoff_s * 2)
+        state.tapo_next_attempt_at = now_mono + state.tapo_backoff_s
+
+    def _note_tapo_success(now_mono: float) -> None:
+        state.tapo_backoff_s = 0.0
+        state.tapo_next_attempt_at = now_mono + max(0.0, state.tapo_min_interval_s)
+
     try:
         while True:
-            # retry tapo occasionally if not connected
-            if (device_shared is None and state.shared_device) or (
-                not state.shared_device and (device_co2 is None or device_rh is None)
-            ):
-                await ensure_tapo_connected()
+            now_mono = time.monotonic()
+
+            # retry tapo occasionally if not connected (also rate-limited by backoff)
+            if now_mono >= state.tapo_next_attempt_at:
+                if (device_shared is None and state.shared_device) or (
+                    not state.shared_device and (device_co2 is None or device_rh is None)
+                ):
+                    await ensure_tapo_connected()
 
             if scd4x is not None and scd4x.data_ready:
                 state.co2 = int(scd4x.CO2)
@@ -510,7 +528,7 @@ async def run_sensor_loop(state: RuntimeState, log: logging.Logger):
                 elif state.co2_active and state.co2 <= state.co2_off:
                     state.co2_active = False
 
-                                # ----- RH hysteresis (humidifier-only) -----
+                # ----- RH hysteresis (humidifier-only) -----
                 # ON when too dry, OFF when humid enough
                 if state.rh is not None:
                     if (not state.rh_active) and (state.rh < state.rh_on):
@@ -519,33 +537,79 @@ async def run_sensor_loop(state: RuntimeState, log: logging.Logger):
                         state.rh_active = False
 
                 # ----- send commands (avoid spamming) -----
-                try:
-                    if state.shared_device and device_shared is not None:
+                now_mono = time.monotonic()
+                if now_mono >= state.tapo_next_attempt_at:
+                    attempted = False
+                    any_succeeded = False
+                    any_failed = False
+
+                    if state.shared_device:
                         desired = state.co2_active or state.rh_active
-                        if desired != state.last_shared_state:
-                            await (device_shared.on() if desired else device_shared.off())
-                            log.info("Tapo: %s (CO2/RH trigger %s)", "ON" if desired else "OFF", "active" if desired else "cleared")
-                            state.last_shared_state = desired
+                        if device_shared is not None and desired != state.last_shared_state:
+                            attempted = True
+                            try:
+                                await (device_shared.on() if desired else device_shared.off())
+                                log.info(
+                                    "Tapo: %s (CO2/RH trigger %s)",
+                                    "ON" if desired else "OFF",
+                                    "active" if desired else "cleared",
+                                )
+                                state.last_shared_state = desired
+                                any_succeeded = True
+                            except Exception as e:
+                                state.last_error = f"Tapo command failed: {e}"
+                                log.warning(state.last_error)
+                                any_failed = True
+                                _note_tapo_failure_backoff(now_mono)
+                                if _is_session_timeout(e):
+                                    log.info("Tapo: session timeout; forcing reconnect")
+                                    client = None
+                                    device_shared = None
 
                     else:
                         if device_co2 is not None:
                             desired = state.co2_active
                             if desired != state.last_co2_state:
-                                await (device_co2.on() if desired else device_co2.off())
-                                log.info("Tapo CO2 device: %s", "ON" if desired else "OFF")
-                                state.last_co2_state = desired
+                                attempted = True
+                                try:
+                                    await (device_co2.on() if desired else device_co2.off())
+                                    log.info("Tapo CO2 device: %s", "ON" if desired else "OFF")
+                                    state.last_co2_state = desired
+                                    any_succeeded = True
+                                except Exception as e:
+                                    state.last_error = f"Tapo command failed: {e}"
+                                    log.warning(state.last_error)
+                                    any_failed = True
+                                    _note_tapo_failure_backoff(now_mono)
+                                    if _is_session_timeout(e):
+                                        log.info("Tapo CO2: session timeout; forcing reconnect")
+                                        client = None
+                                        device_co2 = None
 
                         if device_rh is not None:
                             desired = state.rh_active
                             if desired != state.last_rh_state:
-                                await (device_rh.on() if desired else device_rh.off())
-                                log.info("Tapo RH device: %s", "ON" if desired else "OFF")
-                                state.last_rh_state = desired
+                                attempted = True
+                                try:
+                                    await (device_rh.on() if desired else device_rh.off())
+                                    log.info("Tapo RH device: %s", "ON" if desired else "OFF")
+                                    state.last_rh_state = desired
+                                    any_succeeded = True
+                                except Exception as e:
+                                    state.last_error = f"Tapo command failed: {e}"
+                                    log.warning(state.last_error)
+                                    any_failed = True
+                                    _note_tapo_failure_backoff(now_mono)
+                                    if _is_session_timeout(e):
+                                        log.info("Tapo RH: session timeout; forcing reconnect")
+                                        client = None
+                                        device_rh = None
 
-                    state.last_error = None  # clear if things are working
-                except Exception as e:
-                    state.last_error = f"Tapo command failed: {e}"
-                    log.warning(state.last_error)
+                    if any_failed and attempted and state.tapo_backoff_s <= 0:
+                        _note_tapo_failure_backoff(now_mono)
+                    elif any_succeeded and (not any_failed):
+                        state.last_error = None
+                        _note_tapo_success(now_mono)
 
             await asyncio.sleep(2)
 
