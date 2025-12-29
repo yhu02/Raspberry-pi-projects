@@ -32,6 +32,11 @@ def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
     return default if v is None else int(v)
 
+def _env_int0(name: str, default: int) -> int:
+    """Parse int from env, accepting base prefixes like 0x.. (base=0)."""
+    v = os.getenv(name)
+    return default if v is None else int(v, 0)
+
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None else v
@@ -420,27 +425,83 @@ async def run_sensor_loop(state: RuntimeState, log: logging.Logger):
         state.last_error = "Missing TAPO_USERNAME/TAPO_PASSWORD"
         log.error(state.last_error)
 
-    # -------- init I2C + sensor --------
-    try:
-        i2c = busio.I2C(board.SCL, board.SDA)
-    except AttributeError:
-        state.last_error = "board.SCL/board.SDA not available; cannot init I2C"
-        log.error(state.last_error)
-        i2c = None
+    # -------- init I2C + sensor (with retry + diagnostics) --------
+    scd4x_i2c_addr = _env_int0("SCD4X_I2C_ADDRESS", 0x62)
+    sensor_retry_s = _env_float("SCD4X_RETRY_S", 30.0)
 
+    i2c = None
     scd4x = None
-    if i2c is not None:
+    next_sensor_attempt_at = 0.0
+    sensor_init_logged_stack = False
+
+    def _i2c_scan(addrs_i2c) -> str:
         try:
-            scd4x = adafruit_scd4x.SCD4X(i2c)
+            if hasattr(addrs_i2c, "try_lock") and hasattr(addrs_i2c, "unlock") and hasattr(addrs_i2c, "scan"):
+                got = []
+                if addrs_i2c.try_lock():
+                    try:
+                        got = list(addrs_i2c.scan())
+                    finally:
+                        addrs_i2c.unlock()
+                if got:
+                    return ", ".join(hex(a) for a in got)
+                return "(no devices found)"
+        except Exception:
+            pass
+        return "(scan unavailable)"
+
+    def _sensor_hint_text(i2c_scan: str) -> str:
+        return (
+            "Troubleshooting: ensure the sensor is powered (3.3V), wired to SDA/SCL correctly, "
+            "I2C is enabled (raspi-config), and try i2cdetect. "
+            f"Expected SCD4X at 0x{scd4x_i2c_addr:02x}; I2C scan saw: {i2c_scan}. "
+            "You can override the address with SCD4X_I2C_ADDRESS=0x62."
+        )
+
+    async def ensure_sensor_connected(now_mono: float) -> None:
+        nonlocal i2c, scd4x, next_sensor_attempt_at, sensor_init_logged_stack
+
+        if scd4x is not None:
+            return
+        if now_mono < next_sensor_attempt_at:
+            return
+
+        next_sensor_attempt_at = now_mono + max(5.0, sensor_retry_s)
+
+        if i2c is None:
+            try:
+                i2c = busio.I2C(board.SCL, board.SDA)
+            except AttributeError:
+                state.last_error = "board.SCL/board.SDA not available; cannot init I2C"
+                log.error(state.last_error)
+                return
+            except Exception as e:
+                state.last_error = f"Failed to init I2C: {e}"
+                log.warning(state.last_error)
+                return
+
+        scan = _i2c_scan(i2c)
+        try:
+            # Newer adafruit_scd4x supports address=; fall back for older versions.
+            try:
+                scd4x = adafruit_scd4x.SCD4X(i2c, address=scd4x_i2c_addr)
+            except TypeError:
+                scd4x = adafruit_scd4x.SCD4X(i2c)
             try:
                 log.info("Found SCD4x, serial: %s", [hex(i) for i in scd4x.serial_number])
             except Exception:
                 log.info("Found SCD4x (could not read serial number)")
             scd4x.start_periodic_measurement()
             log.info("Measuring... (first reading may take ~5-10s)")
+            state.last_error = None
         except Exception as e:
             state.last_error = f"Failed to initialize SCD4X: {e}"
-            log.exception(state.last_error)
+            msg = state.last_error + ". " + _sensor_hint_text(scan)
+            if not sensor_init_logged_stack:
+                sensor_init_logged_stack = True
+                log.exception(msg)
+            else:
+                log.warning(msg)
             scd4x = None
 
     # -------- connect tapo device(s) --------
@@ -506,6 +567,9 @@ async def run_sensor_loop(state: RuntimeState, log: logging.Logger):
     try:
         while True:
             now_mono = time.monotonic()
+
+            # periodically retry sensor init so wiring/config fixes can recover without restart
+            await ensure_sensor_connected(now_mono)
 
             # retry tapo occasionally if not connected (also rate-limited by backoff)
             if now_mono >= state.tapo_next_attempt_at:
